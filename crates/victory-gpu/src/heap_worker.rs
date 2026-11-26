@@ -32,7 +32,7 @@
 // than when the recording thread did it all; with a backlog it is earlier,
 // since the pass has the whole frame instead of a slice of it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use crate::descriptor::Heap;
@@ -209,8 +209,8 @@ struct Job {
 static JOB: OnceLock<Job> = OnceLock::new();
 /// Held by whoever runs the pass.
 static PASS: Mutex<()> = Mutex::new(());
-/// A recording thread waits for [`PASS`].
-static URGENT: AtomicBool = AtomicBool::new(false);
+/// Number of recording threads waiting for [`PASS`].
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// A pass over `heap` is due (once a frame). False if there is no worker:
 /// the caller runs the pass itself.
@@ -244,18 +244,22 @@ pub(crate) fn kick(heap: &Heap) -> bool {
 /// later submission: what the worker has recorded so far is handed over
 /// first, so the caller's list runs behind it.
 pub(crate) fn urgent() -> MutexGuard<'static, ()> {
-    if let Ok(pass) = PASS.try_lock() {
-        return pass;
+    urgent_pass(&PASS, &WAITERS)
+}
+
+fn urgent_pass<'a>(pass: &'a Mutex<()>, waiters: &AtomicUsize) -> MutexGuard<'a, ()> {
+    if let Ok(guard) = pass.try_lock() {
+        return guard;
     }
-    URGENT.store(true, Relaxed);
-    let pass = lock(&PASS);
-    URGENT.store(false, Relaxed);
-    pass
+    waiters.fetch_add(1, Relaxed);
+    let guard = lock(pass);
+    waiters.fetch_sub(1, Relaxed);
+    guard
 }
 
 /// Whether the worker is to stop where it is ([`urgent`]).
 pub(crate) fn make_way() -> bool {
-    URGENT.load(Relaxed)
+    WAITERS.load(Relaxed) != 0
 }
 
 fn worker() {
@@ -286,5 +290,35 @@ fn worker() {
         while make_way() {
             std::thread::yield_now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_recording_thread_leaves_the_other_waiter_visible() {
+        let pass = Mutex::new(());
+        let waiters = AtomicUsize::new(0);
+        let guard = lock(&pass);
+        std::thread::scope(|scope| {
+            let record = || {
+                let _guard = urgent_pass(&pass, &waiters);
+                waiters.load(Relaxed)
+            };
+            let first = scope.spawn(record);
+            let second = scope.spawn(record);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while waiters.load(Relaxed) != 2 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let queued = waiters.load(Relaxed);
+            drop(guard);
+            assert_eq!(queued, 2);
+            let mut remaining = [first.join().unwrap(), second.join().unwrap()];
+            remaining.sort();
+            assert_eq!(remaining, [0, 1]);
+        });
     }
 }
