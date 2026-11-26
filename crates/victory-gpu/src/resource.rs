@@ -3049,6 +3049,9 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    if address == 0 {
+        return None;
+    }
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -3618,6 +3621,17 @@ mod tests {
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_placed_textures_do_not_register_description_padding() {
+        let mut desc = [0u32; 14];
+        desc[0] = 3;
+        desc[1] = 0xfeed;
+        desc[13] = 0xabcd;
+        assert!(texture_at(0, &desc).is_none());
+        assert!(!PLACED_RAW.lock().unwrap().contains(&(0, desc)));
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

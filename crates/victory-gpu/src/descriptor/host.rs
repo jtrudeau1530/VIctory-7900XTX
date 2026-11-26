@@ -4446,27 +4446,27 @@ fn make_twinned(
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
-            }
             const BUFFER: u32 = 1;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
+                // With no backing address the caller installs the typed null descriptor.
+                if address == 0 {
+                    return None;
+                }
+                if let Some(view) = placed_texture(view) {
+                    return make(&view, at);
+                }
+                // Report the first 64 addresses and then at powers of two.
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
+                if (said.len() < 64 && said.insert(address)) || times.is_power_of_two() {
                     tracing::warn!(
-                        address = format_args!("{at:#x}"),
+                        address = format_args!("{address:#x}"),
+                        unordered = *unordered,
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                        "placed texture view could not be mirrored: resource {resource:?}, view {:?}",
                         &desc[..10]
                     );
                 }
@@ -4474,7 +4474,6 @@ fn make_twinned(
             }
             // The resource description's width, after the alignment.
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
-            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             // An empty title buffer: nothing to view, and no host copy to
             // look for (#70: such views were in flight at device removals).
