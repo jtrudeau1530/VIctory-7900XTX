@@ -4326,42 +4326,88 @@ mod thread_tests {
     }
 }
 
+/// Looks up `key` in `cache`, calling `create` outside the mutex on a miss
+/// so slow driver `CreateCommandSignature` calls never block other recording
+/// threads on the cache lock.
+fn cached_command_signature<K: Copy + Eq, V: Clone>(
+    cache: &std::sync::Mutex<Vec<(K, V)>>,
+    key: K,
+    create: impl FnOnce() -> Option<V>,
+) -> Option<V> {
+    {
+        let made = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+            return Some(s.clone());
+        }
+    }
+    let created = create();
+    let mut made = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let created = created?;
+    made.push((key, created.clone()));
+    Some(created)
+}
+
 /// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
+/// `stride` bytes apart (no root arguments, so no root signature), cached by argument and stride.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    cached_command_signature(&MADE, (kind, stride), || {
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        signature
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn command_signature_creation_releases_the_cache_and_keeps_a_competing_result() {
+    let cache = std::sync::Mutex::new(vec![(1, 100)]);
+    let found = cached_command_signature(&cache, 2, || {
+        assert_eq!(cache.try_lock().unwrap().as_slice(), &[(1, 100)]);
+        assert_eq!(cached_command_signature(&cache, 1, || unreachable!()), Some(100));
+        assert_eq!(cached_command_signature(&cache, 2, || Some(200)), Some(200));
+        Some(201)
+    });
+    assert_eq!(found, Some(200));
+    assert_eq!(cached_command_signature(&cache, 2, || unreachable!()), Some(200));
+    assert_eq!(cached_command_signature(&cache, 3, || None), None);
+    assert_eq!(cached_command_signature(&cache, 3, || Some(300)), Some(300));
+
+    let found = cached_command_signature(&cache, 4, || {
+        assert!(cache.try_lock().is_ok());
+        std::thread::scope(|scope| {
+            let winner = scope.spawn(|| cached_command_signature(&cache, 4, || Some(400)));
+            assert_eq!(winner.join().unwrap(), Some(400));
+        });
+        None
+    });
+    assert_eq!(found, Some(400));
+    assert_eq!(cached_command_signature(&cache, 4, || unreachable!()), Some(400));
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
