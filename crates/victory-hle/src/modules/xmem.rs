@@ -1086,13 +1086,6 @@ pub(crate) fn lift_thread() {
     }
 }
 
-/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is
-/// `victory_gpu`'s `port`): read here for xmem's part, [`arrange`].
-fn port_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
-    *ON
-}
-
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
 /// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -1200,8 +1193,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
-    if port_on()
+    // Only the low graphics heap can use the port. Do not change its
+    // section layout if the renderer cannot use that section in place.
+    if base <= u32::MAX as usize
         && let Some(pages) = &pages
+        && !pages.is_empty()
+        && victory_gpu::port_constants_available()
     {
         arrange(base, pages);
     }
