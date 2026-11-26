@@ -918,8 +918,29 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    with_writes(start, end, guarded, |j, pages| {
+        j.written.range(pages).map(|(&page, &write)| (page, write)).collect()
+    })
+}
+
+/// This asking and whether the range is unchanged since a texture last read
+/// it. Zero means it has never been read. The journal still records every
+/// new write even when the caller needs only the asking number.
+pub(crate) fn unchanged_since(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, bool)> {
+    with_writes(start, end, guarded, |j, pages| {
+        since != 0 && j.written.range(pages).all(|(_, &write)| write <= since)
+    })
+}
+
+/// Reads the answer under the same journal lock that establishes its asking.
+fn with_writes<T>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    read: impl Fn(&Journal, std::ops::Range<usize>) -> T,
+) -> Option<(u64, T)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| read(j, first..last);
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
@@ -3423,6 +3444,18 @@ mod tests {
         let (now, after) = writes(start, end, false).expect("watched");
         let new = |w: Vec<(usize, u64)>| w.into_iter().filter(|w| w.1 > none).collect::<Vec<_>>();
         assert_eq!(new(after), [(p / PAGE + 1, now)]);
+        // Textures track one asking for all their pages. A write in
+        // another page is outside the query, and an equal asking is clean.
+        assert!(!unchanged_since(start, end, false, 0).unwrap().1);
+        assert!(!unchanged_since(start, end, false, none).unwrap().1);
+        assert!(unchanged_since(start, start + PAGE, false, none).unwrap().1);
+        assert!(unchanged_since(start, end, false, now).unwrap().1);
+        // A texture asking first must record the write for other consumers.
+        // SAFETY: the fourth page of our committed allocation.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write_volatile(1) };
+        let (changed, clean) = unchanged_since(start, end, false, now).expect("watched");
+        assert!(!clean);
+        assert!(writes(start, end, false).unwrap().1.contains(&(p / PAGE + 3, changed)));
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
@@ -3785,6 +3818,13 @@ mod tests {
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges, false);
         let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let (asked, pages) = writes(p, p + 4 * PAGE, false).expect("asked ahead");
+        for since in [0, copied, asked] {
+            let expected = since != 0 && pages.iter().all(|&(_, w)| w <= since);
+            for guarded in [false, true] {
+                assert_eq!(unchanged_since(p, p + 4 * PAGE, guarded, since), Some((asked, expected)));
+            }
+        }
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.

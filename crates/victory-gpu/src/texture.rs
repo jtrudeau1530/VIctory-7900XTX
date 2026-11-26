@@ -1215,8 +1215,10 @@ impl Staging {
             }
             last.asked_frame = frame;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if !alone
+            && let Some((now, unwritten)) = waited(1, || crate::watch::unchanged_since(start, start + size, false, last.asked))
+        {
+            if unwritten {
                 return 0;
             }
             last.asked = now;
@@ -1245,10 +1247,9 @@ impl Staging {
         let mut blind = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, unwritten)) = waited(1, || crate::watch::unchanged_since(start, start + size, true, last.asked))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
@@ -1379,7 +1380,8 @@ impl Staging {
             // Detiled before: the submission's check is cheap.
             return true;
         }
-        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let asked = crate::watch::unchanged_since(start, start + size, false, 0)
+            .or_else(|| crate::watch::unchanged_since(start, start + size, true, 0));
         let Some((now, _)) = asked else {
             return false;
         };
