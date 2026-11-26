@@ -186,9 +186,33 @@ fn host_compile(p: &Arc<Pending>) -> Option<HostPipeline> {
 }
 
 /// [`HostPipeline::new`] of `shaders` (with `p`'s graphics state) on a
-/// thread of its own (8 MiB of stack, below-normal priority), waited for by
-/// its handle; [`Died`] if the thread ended without an answer.
+/// thread of its own (8 MiB of stack, below-normal priority). With
+/// `VICTORY_REUSE_COMPILER=1` each caller keeps its isolated thread for the
+/// next compile. The default starts one per attempt. Both paths wait for
+/// a result or the thread handle; [`Died`] if it ended without an answer.
 fn compile_on_thread(p: &Arc<Pending>, shaders: &[Arc<Shader>]) -> Result<Option<HostPipeline>, Died> {
+    static REUSE: OnceLock<bool> = OnceLock::new();
+    if *REUSE.get_or_init(|| std::env::var_os("VICTORY_REUSE_COMPILER").is_some_and(|value| value == "1")) {
+        type Job = (Arc<Pending>, Vec<Arc<Shader>>);
+        thread_local! {
+            static WORKER: std::cell::RefCell<Option<super::compile_worker::Worker<Job, Made>>> = const { std::cell::RefCell::new(None) };
+        }
+        let result = WORKER.with_borrow_mut(|slot| {
+            if slot.is_none() {
+                *slot = super::compile_worker::Worker::spawn(|(p, shaders): Job| Made(HostPipeline::new(&shaders, p.graphics.as_deref()))).ok();
+            }
+            let worker = slot.as_mut()?;
+            let result = worker.run((p.clone(), shaders.to_vec()));
+            if result.is_none() {
+                *slot = None;
+            }
+            Some(result.map(|made| made.0).ok_or(Died))
+        });
+        if let Some(result) = result {
+            return result;
+        }
+        // A persistent worker could not start. Use the existing one-shot path.
+    }
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};

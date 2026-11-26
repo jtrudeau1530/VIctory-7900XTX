@@ -806,6 +806,7 @@ pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+mod compile_worker;
 mod make;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
