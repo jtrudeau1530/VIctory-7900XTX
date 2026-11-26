@@ -37,6 +37,7 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    completion: (Mutex<()>, Condvar),
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -68,6 +69,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            completion: (Mutex::new(()), Condvar::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             died: AtomicBool::new(false),
@@ -103,7 +105,7 @@ impl Pending {
                 made
             });
         }
-        let (lock, done) = &DONE;
+        let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -260,9 +262,6 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
-
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
@@ -343,6 +342,43 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// The newest frame that has requested a wait, and its spent or
+/// reserved budget. A late caller from an older frame cannot reopen it
+/// or erase the reservations of a newer frame.
+#[derive(Default)]
+struct WaitBudget {
+    frame: Option<u64>,
+    spent: Duration,
+}
+
+impl WaitBudget {
+    fn reserve(&mut self, frame: u64, budget: Duration, shared: bool) -> Duration {
+        if self.frame.is_some_and(|current| frame < current) {
+            return Duration::ZERO;
+        }
+        if self.frame != Some(frame) {
+            self.frame = Some(frame);
+            self.spent = Duration::ZERO;
+        }
+        let left = budget.saturating_sub(self.spent);
+        if shared {
+            self.spent += left;
+        }
+        left
+    }
+
+    fn finish(&mut self, frame: u64, reserved: Duration, elapsed: Duration, shared: bool) {
+        if self.frame == Some(frame) {
+            let waited = elapsed.min(reserved);
+            if shared {
+                self.spent = self.spent.saturating_sub(reserved - waited);
+            } else {
+                self.spent = self.spent.saturating_add(waited);
+            }
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -352,26 +388,19 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<WaitBudget>; 2] =
+        [const { Mutex::new(WaitBudget { frame: None, spent: Duration::ZERO }) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
-        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        spent_of.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, budget, shared)
     };
     if left.is_zero() {
         return;
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.completion;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
@@ -391,17 +420,7 @@ fn wait(p: &Pending, frame: u64) {
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
-    {
-        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
-    }
+    spent_of.lock().unwrap_or_else(|e| e.into_inner()).finish(frame, left, waited, shared);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -625,6 +644,37 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_frame_cannot_reset_newer_budget() {
+        for shared in [false, true] {
+            let ms = Duration::from_millis;
+            let mut state = WaitBudget::default();
+            let first = state.reserve(10, ms(500), shared);
+            assert_eq!(first, ms(500));
+            state.finish(10, first, ms(300), shared);
+            let next = state.reserve(11, ms(500), shared);
+            assert_eq!(next, ms(500));
+            assert_eq!(state.reserve(10, ms(500), shared), Duration::ZERO);
+            state.finish(10, first, ms(400), shared);
+            state.finish(11, next, ms(120), shared);
+            assert_eq!(state.reserve(11, ms(500), shared), ms(380));
+        }
+    }
+
+    #[test]
+    fn shared_reservations_do_not_overbook() {
+        let ms = Duration::from_millis;
+        let mut state = WaitBudget::default();
+        let first = state.reserve(0, ms(500), true);
+        assert_eq!(state.reserve(0, ms(500), true), Duration::ZERO);
+        state.finish(0, first, ms(80), true);
+        let second = state.reserve(0, ms(500), true);
+        assert_eq!(second, ms(420));
+        state.finish(0, second, ms(600), true);
+        assert_eq!(state.reserve(0, ms(500), true), Duration::ZERO);
+        assert_eq!(state.reserve(1, ms(500), true), ms(500));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
