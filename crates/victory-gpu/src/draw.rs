@@ -3733,13 +3733,19 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                        let Some((payload, rounded)) = crate::descriptor::host::scratch_constant_range(address, size) else {
+                            host.make_at(index, &View::Constant(0, 0));
                             continue;
                         };
+                        let Some((buffer, gpu, to)) = list.scratch_held(u64::from(rounded)) else {
+                            host.make_at(index, &View::Constant(0, 0));
+                            continue;
+                        };
+                        // SAFETY: the list holds an upload allocation of `rounded` bytes.
+                        unsafe { to.add(payload as usize).write_bytes(0, (rounded - payload) as usize) };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        list.defer_constants(to, address as *const u8, payload as usize, slot);
+                        host.constant_at(index, &buffer, gpu, payload);
                     }
                     Some(view) => {
                         host.make_at(index, &view);

@@ -4244,13 +4244,24 @@ fn twin_uav(
     Some(desc)
 }
 
+const MAX_CONSTANT_BYTES: u32 = 64 << 10;
+
 /// The bytes of the host's constant buffer view for a title's of `size`:
 /// whole 256s, and at most the 64 KiB a shader can index. The host removes
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
 fn constant_bytes(size: u32) -> u32 {
-    const LARGEST: u32 = 64 << 10;
-    size.min(LARGEST).next_multiple_of(256)
+    size.min(MAX_CONSTANT_BYTES).next_multiple_of(256)
+}
+
+/// Bytes to copy from title memory and bytes the host view can read.
+pub(crate) fn scratch_constant_range(address: u64, size: u32) -> Option<(u32, u32)> {
+    let payload = size.min(MAX_CONSTANT_BYTES);
+    if address == 0 || payload == 0 {
+        return None;
+    }
+    address.checked_add(u64::from(payload))?;
+    Some((payload, constant_bytes(payload)))
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4271,8 +4282,17 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
+            address.checked_add(u64::from(size))?;
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            let bytes = constant_bytes(size);
+            if shadow.offset_in(address)?.checked_add(u64::from(bytes))? > shadow.width() {
+                once!(address, size, "constant buffer view extends beyond its host buffer");
+                return None;
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -4282,7 +4302,7 @@ fn make_twinned(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: constant_bytes(size),
+                SizeInBytes: bytes,
             };
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
@@ -5253,6 +5273,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scratch_constant_range_is_bounded_and_aligned() {
+        assert_eq!(scratch_constant_range(0x1010, 16), Some((16, 256)));
+        assert_eq!(scratch_constant_range(0x1010, 257), Some((257, 512)));
+        assert_eq!(scratch_constant_range(0x1010, u32::MAX), Some((65_536, 65_536)));
+        assert_eq!(scratch_constant_range(0x1010, 0), None);
+        assert_eq!(scratch_constant_range(0, 256), None);
+        assert_eq!(scratch_constant_range(u64::MAX - 15, 16), None);
+    }
+
     /// A constant buffer view larger than the host takes is cut to what it
     /// takes: the device, which such a view removes, stays.
     #[test]
@@ -5280,6 +5310,12 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+        for view in [View::Constant(0, 256), View::Constant(u64::MAX - 15, 16)] {
+            assert!(make(&view, heap.cpu(2)).is_none());
+            heap.make_at(2, &view);
+            assert!(alive(), "an invalid view must leave a null descriptor");
+        }
+        eprintln!("constant buffer bounds regression exercised on host device");
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
