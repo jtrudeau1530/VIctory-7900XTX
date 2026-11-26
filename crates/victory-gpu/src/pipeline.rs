@@ -251,12 +251,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
+    let (stores, stores_by_address) = store_flags(&programs);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
     });
-    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -404,19 +403,36 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// Compute both write flags from the same decoded instruction stream.
+#[cfg(windows)]
+fn store_flags(programs: &[victory_shader::NativeProgram]) -> (bool, bool) {
+    if programs.is_empty() {
+        return (true, true);
+    }
+    let mut buffer = false;
+    for program in programs {
+        let Ok(code) = victory_shader::gfx10::decode(&program.code) else {
+            return (true, true);
+        };
+        // A flat or global write also counts as a write to buffer memory.
+        if stores_by_address(&code) {
+            return (true, true);
+        }
+        buffer = buffer || stores(&code);
+    }
+    (buffer, false)
+}
+
 /// Whether a console program can store to buffer memory: it has a buffer,
 /// typed-buffer, scalar-memory, flat or global store or atomic, or code
 /// that is not all known (an instruction of those kinds outside our table,
-/// an indirect jump, code that does not decode). Stores to textures
+/// an indirect jump). Stores to textures
 /// (image instructions) and to the program's own scratch memory do not
 /// count: neither reaches a buffer's host copy. After upstream #413,
 /// which leaves scalar-memory stores out and counts image stores.
 #[cfg(windows)]
-fn stores(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
+fn stores(code: &[victory_shader::gfx10::Instruction]) -> bool {
+    use victory_shader::gfx10::Encoding;
     code.iter().any(|i| {
         let name = i.name();
         match i.encoding {
@@ -434,15 +450,12 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
 }
 
 /// Whether a console program can store to memory through raw addresses
-/// (`crate::memory`): a flat or global store or atomic, or code that does
-/// not decode. The programs that only walk ray-tracing structures do not,
+/// (`crate::memory`): a flat or global store or atomic.
+/// The programs that only walk ray-tracing structures do not,
 /// whatever they store through views.
 #[cfg(windows)]
-fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
-    use victory_shader::gfx10::{Encoding, decode};
-    let Ok(code) = decode(&program.code) else {
-        return true;
-    };
+fn stores_by_address(code: &[victory_shader::gfx10::Instruction]) -> bool {
+    use victory_shader::gfx10::Encoding;
     code.iter().any(|i| {
         matches!(i.encoding, Encoding::Flat | Encoding::Global)
             && i.name()
@@ -838,6 +851,34 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn store_flags_combine_programs_and_keep_unknown_code_conservative() {
+        let program = |words: &[u32]| victory_shader::NativeProgram {
+            stage: victory_shader::HwStage::Cs,
+            wave64: false,
+            vgprs: 0,
+            layout: vec![],
+            used: vec![],
+            io: Default::default(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let end = 0xbf81_0000;
+        let read_only = || program(&[end]);
+        // buffer_store_dwordx4 followed by s_endpgm.
+        let buffer_write = || program(&[0xe078_1000, 0x8002_0007, end]);
+        assert_eq!(store_flags(&[]), (true, true));
+        assert_eq!(store_flags(&[read_only()]), (false, false));
+        assert_eq!(store_flags(&[read_only(), buffer_write()]), (true, false));
+        let raw_write = program(&[0xdc70_0000, 0, end]); // flat_store_dword
+        let raw_code = victory_shader::gfx10::decode(&raw_write.code).unwrap();
+        assert_eq!(raw_code[0].name(), Some("flat_store_dword"));
+        assert_eq!(store_flags(&[buffer_write(), raw_write]), (true, true));
+        // A truncated buffer instruction in a later program still matters
+        // after a previous program has established the buffer-write flag.
+        assert_eq!(store_flags(&[buffer_write(), program(&[0xe078_1000])]), (true, true));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
