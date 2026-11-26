@@ -264,25 +264,30 @@ impl<W: Work> Lane<W> {
         }
     }
 
-    /// Does one entry: the oldest that is the first of its queue and free to
-    /// run. Whether there was one. Only one thread calls this.
-    fn step(&self, limit: u64) -> bool {
+    /// Takes the oldest eligible queue head and marks its queue as running.
+    /// The flag says whether a pending present forced a wait to proceed.
+    fn take_ready(&self, limit: u64) -> Option<(Entry<W>, bool)> {
         // Each queue's first entry, oldest first.
         let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
         // Whether one of them stands for others not known yet.
         let mut folded = false;
         {
-            let state = self.lock();
+            let mut state = self.lock();
             for e in state.items.iter().take_while(|e| e.number < limit) {
                 if !heads.iter().any(|h| h.1 == e.queue) {
-                    heads.push((e.number, e.queue, e.what.ask(), e.what.shows()));
+                    let ask = e.what.ask();
+                    if heads.is_empty() && ask.is_none() {
+                        // The very first entry can run now, even if it is a present.
+                        let entry = state.items.pop_front()?;
+                        state.running = Some(entry.queue);
+                        return Some((entry, false));
+                    }
+                    heads.push((e.number, e.queue, ask, e.what.shows()));
                     folded |= e.what.folded();
                 }
             }
         }
-        let Some(&(first, ..)) = heads.first() else {
-            return false;
-        };
+        let &(first, ..) = heads.first()?;
         let ready = heads.iter().find(|(number, _, ask, shows)| match ask {
             Some(ask) => W::met(ask),
             // A present comes behind everything given before it.
@@ -296,25 +301,27 @@ impl<W: Work> Lane<W> {
                 // frames (`super::present`). (Not while there is work whose
                 // parts are not known: it may be what is waited for.)
                 if folded {
-                    return false;
+                    return None;
                 }
                 let state = self.lock();
                 if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
-                    return false;
+                    return None;
                 }
                 (first, true)
             }
         };
-        let mut entry = {
-            let mut state = self.lock();
-            let Some(at) = state.items.iter().position(|e| e.number == number) else {
-                return false;
-            };
-            let Some(entry) = state.items.remove(at) else {
-                return false;
-            };
-            state.running = Some(entry.queue);
-            entry
+        let mut state = self.lock();
+        let at = state.items.iter().position(|e| e.number == number)?;
+        let entry = state.items.remove(at)?;
+        state.running = Some(entry.queue);
+        Some((entry, forced))
+    }
+
+    /// Does one entry: the oldest that is the first of its queue and free to
+    /// run. Whether there was one. Only one thread calls this.
+    fn step(&self, limit: u64) -> bool {
+        let Some((mut entry, forced)) = self.take_ready(limit) else {
+            return false;
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
         if entry.what.folded() {
@@ -957,6 +964,19 @@ mod tests {
     fn look(lane: &Lane<T>) {
         let limit = lane.lock().next;
         lane.look(limit);
+    }
+
+    #[test]
+    fn ready_heads_respect_the_look_limit() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        lane.push(1, [T::Run("before", log.clone())]);
+        let limit = lane.lock().next;
+        lane.push(2, [T::Present("later", log.clone())]);
+        lane.look(limit);
+        assert_eq!(*log.lock().unwrap(), ["before"]);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["before", "later"]);
     }
 
     /// A queue's order is kept, a wait for another queue's signal holds only
