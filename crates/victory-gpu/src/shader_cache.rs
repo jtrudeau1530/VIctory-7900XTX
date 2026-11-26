@@ -175,12 +175,12 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. Keep the translated shader until the cache publishes the entry.
 struct Translate<'a, F> {
     translate: F,
     /// The build of the translator, written into the entry.
     source: &'a str,
-    ran: AtomicBool,
+    translated: OnceLock<HostShader>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<'_, F> {
@@ -192,9 +192,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader, self.source))
+        let bytes = encode(&shader, self.source);
+        let _ = self.translated.set(shader);
+        Ok(bytes)
     }
 }
 
@@ -220,19 +221,24 @@ fn cached_by(
     refresh: bool,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
-    let converter = Translate {
+    let mut converter = Translate {
         translate,
         source,
-        ran: AtomicBool::new(false),
+        translated: OnceLock::new(),
     };
     let mut old: Option<HostShader> = None;
     for _ in 0..3 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let ran = converter.ran.load(Ordering::Relaxed);
-            if !ran && made_by != source.as_bytes() {
+        let translated = converter.translated.take();
+        let ran = translated.is_some();
+        let entry = translated.map(|shader| (shader, false)).or_else(|| {
+            let (shader, made_by) = decode(&std::fs::read(&path).ok()?)?;
+            Some((shader, made_by != source.as_bytes()))
+        });
+        if let Some((shader, stale)) = entry {
+            if stale {
                 STALE.fetch_add(1, Ordering::Relaxed);
                 if refresh && old.is_none() {
                     // Translated again in its place; what came out before
