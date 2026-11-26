@@ -218,6 +218,7 @@ impl Shader {
             hash: self.hash.clone(),
             container: self.container.clone(),
             ambient: self.ambient,
+            probe: self.probe,
             translated: OnceLock::new(),
         };
         let tables = crate::draw::TablePlan::new(&first.used, &host.root_indexed_views);
