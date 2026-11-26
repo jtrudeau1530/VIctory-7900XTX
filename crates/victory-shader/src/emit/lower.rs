@@ -6,6 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -273,6 +274,9 @@ struct Lower<'a> {
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
+    /// Scalar and vector instructions that read each value, built on the
+    /// first descriptor query. Phi inputs also have entries, possibly empty.
+    numeric_uses: OnceCell<HashMap<Value, Vec<&'a Inst>>>,
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
     /// buffer's): no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
@@ -2046,6 +2050,7 @@ impl<'a> Lower<'a> {
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
+            numeric_uses: OnceCell::new(),
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
@@ -3316,16 +3321,34 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
+    fn numeric_uses(&self) -> &HashMap<Value, Vec<&'a Inst>> {
+        self.numeric_uses.get_or_init(|| {
+            let mut uses: HashMap<Value, Vec<&Inst>> = HashMap::new();
+            for block in &self.x.p.blocks {
+                for phi in &block.phis {
+                    for &arg in &phi.args {
+                        uses.entry(arg).or_default();
+                    }
+                }
+                for inst in &block.insts {
+                    if matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_)) {
+                        for &(_, value) in &inst.reads {
+                            let readers = uses.entry(value).or_default();
+                            if readers.last().is_none_or(|last| !std::ptr::eq(*last, inst)) {
+                                readers.push(inst);
+                            }
+                        }
+                    }
+                }
+            }
+            uses
+        })
+    }
+
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
-                        && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
+        self.numeric_uses().contains_key(&v)
     }
 
     /// Whether some instruction computes with `v` (scalar or vector
@@ -3334,10 +3357,7 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
-            }
+        self.numeric_uses().get(&v).into_iter().flatten().any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
@@ -3349,14 +3369,10 @@ impl<'a> Lower<'a> {
                     | "v_writelane_b32"
                     | "v_cndmask_b32"
             );
-            match &i.fields {
-                Fields::Sop { .. } | Fields::Valu(_) if moves => {
-                    depth > 0 && i.writes.iter().any(|w| self.computed_with(w.1, depth - 1))
-                }
-                Fields::Sop { .. } | Fields::Valu(_) => {
-                    !(name.starts_with("v_cmp") || name.starts_with("s_cmp"))
-                }
-                _ => false,
+            if moves {
+                depth > 0 && i.writes.iter().any(|w| self.computed_with(w.1, depth - 1))
+            } else {
+                !(name.starts_with("v_cmp") || name.starts_with("s_cmp"))
             }
         })
     }
