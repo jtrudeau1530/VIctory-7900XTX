@@ -55,7 +55,7 @@ pub(crate) enum Role {
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
-    let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    let has = |name: &[u8]| memchr::memmem::find(container, name).is_some();
     if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
     } else if has(b"CS_CacheScreenSpaceRadiance") {
