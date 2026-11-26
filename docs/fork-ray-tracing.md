@@ -159,8 +159,13 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_REFLECT=<multiple>` | limits resolved reflections to this multiple of the local indirect light, preserving hue. Try `1` for glossy surfaces lit by outdoor sky indoors. Unset or `0` leaves the reflections alone. |
 
-It is off while the builder runs.
+The stand-in is off while the builder runs. On an RX 7900 XT with RADV
+26.3.1, two warm 720p starts reached the same diner close-up. At
+`VICTORY_AMBIENT=0.8`, setting `VICTORY_AMBIENT_REFLECT=1` removed the
+blue-white glare that covered the irises. In a second matched shot a bright
+floor reflection receded while the ceiling lamp stayed bright.
 
 ## Where to look
 
