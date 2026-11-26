@@ -1346,12 +1346,32 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     if let Some(i) = a_tail.iter().zip(b_tail).rposition(|(x, y)| x != y) {
         return Some(len - a_tail.len() + i);
     }
+    #[cfg(target_arch = "x86_64")]
+    if a_chunks.len() > 1 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU supports AVX2 and both chunk slices hold `len` rounded down.
+        return unsafe { last_difference_avx2(a_chunks, b_chunks) };
+    }
     let chunk = a_chunks.iter().zip(b_chunks).rposition(|(x, y)| x != y)?;
     a_chunks[chunk]
         .iter()
         .zip(&b_chunks[chunk])
         .rposition(|(x, y)| x != y)
         .map(|i| chunk * DIFF_CHUNK + i)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn last_difference_avx2(a: &[[u8; DIFF_CHUNK]], b: &[[u8; DIFF_CHUNK]]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    for (chunk, (x, y)) in a.iter().zip(b).enumerate().rev() {
+        // SAFETY: each array holds all 32 bytes of the unaligned load.
+        let (x, y) = unsafe { (_mm256_loadu_si256(x.as_ptr().cast()), _mm256_loadu_si256(y.as_ptr().cast())) };
+        let different = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32);
+        if different != 0 {
+            return Some(chunk * DIFF_CHUNK + 31 - different.leading_zeros() as usize);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
