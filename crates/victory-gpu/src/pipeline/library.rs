@@ -685,9 +685,15 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as [`NEXT_FILE`] for the next start. Subsequent
+/// saves also replace that pending file until startup promotes it, so an
+/// older pending file cannot overwrite a newer in-place save on restart.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    if !next.exists() && std::fs::rename(tmp, dir.join(LIBRARY_FILE)).is_ok() {
+        return Ok(());
+    }
+    std::fs::rename(tmp, next)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -849,6 +855,52 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    #[test]
+    fn restart_reads_the_latest_save_after_using_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let next = dir.path().join(NEXT_FILE);
+        let tmp = path.with_extension("tmp");
+
+        // A directory at the library path makes the first rename fail.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(&tmp, b"first save").unwrap();
+        replace_library(dir.path(), &tmp).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), b"first save");
+
+        // In-place replacement is possible again by the second save.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"previous library").unwrap();
+        std::fs::write(&tmp, b"second save").unwrap();
+        replace_library(dir.path(), &tmp).unwrap();
+
+        assert_eq!(Blob::of(dir.path()).bytes(), b"second save");
+        assert!(!next.exists());
+        assert_eq!(std::fs::read(path).unwrap(), b"second save");
+    }
+
+    #[test]
+    fn restart_reads_the_latest_save_while_replacement_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let next = dir.path().join(NEXT_FILE);
+        let tmp = path.with_extension("tmp");
+
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(&tmp, b"first save").unwrap();
+        replace_library(dir.path(), &tmp).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), b"first save");
+
+        std::fs::write(&tmp, b"second save").unwrap();
+        replace_library(dir.path(), &tmp).unwrap();
+        assert_eq!(std::fs::read(&next).unwrap(), b"second save");
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"previous library").unwrap();
+        assert_eq!(Blob::of(dir.path()).bytes(), b"second save");
+        assert!(!next.exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
