@@ -37,6 +37,7 @@ pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+mod health;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]

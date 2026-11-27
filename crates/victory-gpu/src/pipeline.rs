@@ -503,6 +503,30 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// For `VICTORY_FRAME_HEALTH` ([`crate::health`]): a draw (`compute`
+/// false) or dispatch of `this` that did not run for want of a host
+/// pipeline, as still being made or never to be (a skipped shader, no
+/// pipeline set, refused).
+#[cfg(windows)]
+pub(crate) fn note_missed(this: This, compute: bool) {
+    use crate::health::Missed;
+    if !crate::health::on() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let skipped = is_skipped(this);
+    #[cfg(not(feature = "diagnostics"))]
+    let skipped = false;
+    // A worker may publish a successful result between the missed bind and this count.
+    let compiling = !this.is_null() && !skipped && !make::failed(&pipeline(this).host);
+    crate::health::note(match (compute, compiling) {
+        (false, true) => Missed::DrawCompiling,
+        (false, false) => Missed::DrawRefused,
+        (true, true) => Missed::ComputeCompiling,
+        (true, false) => Missed::ComputeRefused,
+    });
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

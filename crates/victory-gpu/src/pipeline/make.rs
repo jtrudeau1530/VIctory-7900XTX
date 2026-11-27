@@ -263,6 +263,11 @@ pub(crate) fn hashes(p: &Pending) -> String {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+/// Whether construction of this host pipeline has failed.
+pub(crate) fn failed(p: &Pending) -> bool {
+    matches!(p.made.get(), Some(None))
+}
+
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
