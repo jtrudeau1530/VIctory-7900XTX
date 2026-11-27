@@ -5387,6 +5387,12 @@ impl Host {
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            // Forward within the final submission, whose flight keeps both
+            // lists alive. A cut can recycle the producer independently.
+            if place::forwarding() {
+                let written = line().written.clone();
+                place::forward_fills(&runs, &written);
+            }
             self.submit(&runs, parts, true)
         };
         let Some((mut submitted, sent)) = sent else {
@@ -9081,6 +9087,12 @@ impl Meter {
             late_line(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
+            if place::forwarding() {
+                tracing::info!(
+                    "fills of upload memory that took their bytes from a copy at its place, per frame (VICTORY_FILL_FORWARD=1): {:.1}",
+                    place::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames
+                );
+            }
             upq::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
