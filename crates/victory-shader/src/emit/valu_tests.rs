@@ -268,6 +268,56 @@ fn run_cases_on(
 }
 
 #[test]
+fn rdna2_minmax_sets_scc_from_the_operand_comparison() {
+    let cases = [[0, 5, 0, 0], [5, 0, 0, 0], [7, 7, 0, 0], [u32::MAX, 1, 0, 0]];
+    let mut ran = 0;
+    for (opcode, signed, minimum) in [(6, true, true), (7, false, true), (8, true, false), (9, false, false)] {
+        let shader = build_valu_cs(&[
+            sop2(opcode, 6, 0, 1), // s_min or s_max s6, s0, s1
+            sop2(0x0a, 7, 129, 128), // s_cselect_b32 s7, 1, 0
+            vop1(1, 0, sgpr(7)), // v_mov_b32 v0, s7
+        ]);
+        run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, input, got| {
+            let [a, b, ..] = input;
+            let (a, b) = if signed { (a as i32 as i64, b as i32 as i64) } else { (i64::from(a), i64::from(b)) };
+            let expected = if minimum { a < b } else { a > b };
+            assert_eq!(got, u32::from(expected), "opcode {opcode}, inputs {input:?}");
+            ran += 1;
+        });
+    }
+    if ran != 0 {
+        assert_eq!(ran, 4 * cases.len());
+        eprintln!("RDNA2 scalar comparison cases ran on hardware");
+    }
+}
+
+#[test]
+fn rdna2_lane_select_wraps_wave32_reads_and_writes() {
+    let read_cases = [[4, 0, 0, 0], [36, 0, 0, 0], [68, 0, 0, 0], [u32::MAX, 0, 0, 0]];
+    let mut read = Vec::from(vop3(0x360, 12, vgpr(0), sgpr(0), 0)); // v_readlane_b32 s12, v0, s0
+    read.push(vop1(1, 0, sgpr(12))); // v_mov_b32 v0, s12
+    let mut ran = 0;
+    run_cases_on(&build_cs(&read, 32, 0), &read_cases, &[("hardware", false)], |_, _, input, got| {
+        assert_eq!(got, input[0] & 31, "read lane {}", input[0]);
+        ran += 1;
+    });
+
+    let write_cases = [[4, 4, 123, 0], [36, 4, 123, 0], [68, 4, 123, 0], [36, 5, 123, 0]];
+    let mut write = Vec::from(vop3(0x361, 0, sgpr(2), sgpr(0), 0)); // v_writelane_b32 v0, s2, s0
+    write.extend_from_slice(&vop3(0x360, 12, vgpr(0), sgpr(1), 0)); // v_readlane_b32 s12, v0, s1
+    write.push(vop1(1, 0, sgpr(12))); // v_mov_b32 v0, s12
+    run_cases_on(&build_cs(&write, 32, 0), &write_cases, &[("hardware", false)], |_, _, input, got| {
+        let expected = if input[0] & 31 == input[1] { input[2] } else { input[1] };
+        assert_eq!(got, expected, "write lane {}, read lane {}", input[0], input[1]);
+        ran += 1;
+    });
+    if ran != 0 {
+        assert_eq!(ran, read_cases.len() + write_cases.len());
+        eprintln!("RDNA2 lane wrap cases ran on hardware");
+    }
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
