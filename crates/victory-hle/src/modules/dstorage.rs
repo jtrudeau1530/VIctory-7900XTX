@@ -1304,9 +1304,10 @@ fn half_submits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
 }
 
-/// Adds a command to the queue; blocks while the queue is full. A queue
-/// that is full of commands nobody submitted submits itself, since nothing
-/// else could make room.
+/// Adds a command to the queue; blocks while a full queue has work in flight.
+/// With only enqueued commands, a full queue normally submits itself. Page
+/// destinations can exceed capacity until the title fills their page lists
+/// and submits them. The title does both after its enqueue calls return.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -1323,6 +1324,13 @@ fn queue(this: QueueRef, command: Command) {
             break;
         }
         if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
+            if !half_submits()
+                && lane.unsubmitted.iter().any(|command| {
+                    matches!(command, Command::Read(read) if read.request.options & PAGE_DESTINATION != 0)
+                })
+            {
+                break;
+            }
             tracing::warn!(
                 queue = id,
                 commands = lane.unsubmitted.len(),
@@ -1994,8 +2002,10 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_waits_for_the_submit() {
+    fn a_full_queue_holds_page_destinations_for_the_titles_submit() {
         use crate::modules::xmem;
+        const REQUESTS: u64 = 140;
+        const BYTES: usize = REQUESTS as usize * 64;
         // Two pages the title owns: the one its list still names from
         // earlier, and the one it maps for this batch when it submits.
         let mut pages = [0usize; 2];
@@ -2005,8 +2015,8 @@ mod tests {
         let plain = pattern(64);
         let mut list = [stale];
         let (queue, array) = (new_queue(1), status_array(1));
-        // More than half of the queue's 128.
-        for i in 0..100 {
+        // More than fits in the queue's 128 slots.
+        for i in 0..REQUESTS {
             let mut r = request(
                 PAGE_DESTINATION | MEMORY_SOURCE,
                 list.as_mut_ptr().cast(),
@@ -2018,17 +2028,25 @@ mod tests {
             r.page_offset = i * 64;
             enqueue(queue, &r);
         }
-        std::thread::sleep(Duration::from_millis(50));
-        // SAFETY: our own list, which a worker may be reading.
+        // SAFETY: the queue was created above and is still live.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        let held = scheduler().unwrap().lock().lanes[&id].unsubmitted.len();
+        if held != REQUESTS as usize {
+            void(queue, 0x40);
+            panic!("page reads submitted while the destination list was stale");
+        }
+        // SAFETY: nothing from this queue can read the list before Submit.
         unsafe { std::ptr::write_volatile(list.as_mut_ptr(), right) };
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
+        let result = wait(array, 0);
+        void(queue, 0x40);
+        assert_eq!(result, S_OK);
         let bytes = |page: usize| -> Vec<u8> {
-            xmem::page_window(&[page], 0, 6400).unwrap().bytes().to_vec()
+            xmem::page_window(&[page], 0, BYTES).unwrap().bytes().to_vec()
         };
-        assert!(bytes(stale) == [0; 6400], "written to the page the list named before");
-        assert!(bytes(right) == plain.repeat(100), "not written to the page the list names");
+        assert!(bytes(stale) == [0; BYTES], "written to the page the list named before");
+        assert!(bytes(right) == plain.repeat(REQUESTS as usize), "not written to the page the list names");
     }
 
     #[test]
