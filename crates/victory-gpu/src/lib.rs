@@ -105,6 +105,8 @@ mod texback;
 mod vq;
 #[cfg(windows)]
 pub use vq::{came as query_cache_came, gone as query_cache_gone};
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use host::on_failure;
