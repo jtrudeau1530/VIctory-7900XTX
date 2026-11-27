@@ -459,10 +459,10 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        self.push_as(p, priority, || slow_limit() != usize::MAX && super::library::slow(&p.key))
     }
 
-    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+    fn push_as(&mut self, p: &Arc<Pending>, priority: u8, is_slow: impl FnOnce() -> bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -472,7 +472,7 @@ impl Queue {
             self.screen.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
-        } else if slow {
+        } else if is_slow() {
             self.slow.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -689,15 +689,17 @@ mod tests {
         let (long, longer, asked, quick) = (new(), new(), new(), new());
         let mut queue = Queue::new();
         for p in [&long, &longer, &asked] {
-            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+            assert_eq!(queue.push_as(p, EARLY, || true), Some(true));
         }
-        assert_eq!(queue.push_as(&quick, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&quick, EARLY, || false), Some(true));
         // The quick one first, then one long one at a time; one a draw asks
         // for waits for nobody.
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &long));
         assert!(queue.pop(false, 1).is_none());
-        assert_eq!(queue.push_as(&asked, REQUESTED, true), Some(false));
+        let unexpected_lookup = || panic!("only a new early entry needs slow classification");
+        assert_eq!(queue.push_as(&asked, REQUESTED, unexpected_lookup), Some(false));
+        assert_eq!(queue.push_as(&asked, EARLY, unexpected_lookup), None);
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
         assert!(!asked.was_slow.load(Ordering::Relaxed));
         assert!(queue.pop(false, 1).is_none());
