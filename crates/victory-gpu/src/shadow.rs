@@ -5657,14 +5657,28 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
+    let pooled = view_pool();
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            let keep =
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+            if !keep && pooled {
+                view_pool_put(view_pool_size(shadow.len), &shadow.buffer, shadow.data);
+            }
+            keep
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = if pooled {
+        let size = view_pool_size(len);
+        match view_pool_take(size) {
+            Some(taken) => taken,
+            None => host()?.shared_buffer(size)?,
+        }
+    } else {
+        host()?.shared_buffer(len.next_multiple_of(256))?
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5673,6 +5687,65 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Whether the buffers of [`exact`]'s copies are used again once their copy
+/// goes (`VICTORY_VIEW_POOL=1`; off by default).
+///
+/// The title places these views at ring positions that move every frame,
+/// so their copies come and go: 350-400 made a frame in gameplay (run 2 of
+/// 2026-11-27, Series S profile, an RTX 5070), each a buffer of its own that
+/// is waited for until the card has mapped it (`crate::host::mapped`):
+/// 864,839 buffers and 78 s of waiting in ten minutes, 17 % of the run.
+/// With the pool, a copy that goes leaves its buffer in a list by size, and
+/// the next copy of that size takes it. A copy is only let go when nothing
+/// but the map holds it and no slot shows its buffer, so the card no longer
+/// reads it; a new copy has no page copied yet (`Shadow::copied`), so the
+/// bytes left in a buffer taken again are never read before they are
+/// replaced. Sizes are rounded up to a power of two of 64 KiB or more (a
+/// committed buffer takes 64 KiB however small it is), and the pool holds
+/// at most `VICTORY_VIEW_POOL_MB` (256 unless set) of them.
+fn view_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_POOL").is_some_and(|v| v == "1"))
+}
+
+fn view_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_VIEW_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// The size of the buffer a copy of `len` bytes gets from the pool.
+pub(crate) fn view_pool_size(len: u64) -> u64 {
+    len.max(1).next_power_of_two().max(64 << 10)
+}
+
+/// Buffers of copies that went, by size, with their mapped bytes; and the
+/// bytes of them all.
+#[allow(clippy::type_complexity)]
+static VIEW_POOL: Mutex<(u64, BTreeMap<u64, Vec<(ID3D12Resource, usize)>>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Since the start: buffers taken from the pool, and buffers put in it.
+pub(crate) static VIEW_POOL_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn view_pool_put(size: u64, buffer: &ID3D12Resource, data: *mut u8) {
+    let mut pool = VIEW_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.0 + size > view_pool_most() {
+        return;
+    }
+    pool.0 += size;
+    pool.1.entry(size).or_default().push((buffer.clone(), data as usize));
+    VIEW_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn view_pool_take(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut pool = VIEW_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let (buffer, data) = pool.1.get_mut(&size)?.pop()?;
+    pool.0 -= size;
+    VIEW_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    Some((buffer, data as *mut u8))
 }
 
 /// Copies of single views' bytes made since the start.
@@ -5687,11 +5760,15 @@ pub(crate) fn exact_line(frames: f64) {
         return;
     }
     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let [taken, put] = [0, 1].map(|i| VIEW_POOL_STATS[i].load(Ordering::Relaxed));
+    let pooled = VIEW_POOL.lock().unwrap_or_else(|e| e.into_inner()).0 >> 20;
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; \
+         their buffers used again (VICTORY_VIEW_POOL={}): {taken} taken from the pool, {put} put in, {pooled} MB in it now",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        u8::from(view_pool())
     );
 }
 

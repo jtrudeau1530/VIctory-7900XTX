@@ -334,6 +334,31 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     Ok(())
 }
 
+/// Which lines of ours make shared buffers ([`Host::shared_buffer`]), how
+/// many and how many bytes: each is memory of its own that is waited for
+/// until it is mapped ([`mapped`]), and a run made 864,839 of them in ten
+/// minutes (10 GB, 12 KB each). The busiest lines are logged every 20,000.
+#[cfg(feature = "diagnostics")]
+fn shared_buffer_caller(at: &'static std::panic::Location<'static>, size: u64) {
+    static BY: Mutex<Option<std::collections::HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
+    let mut by = BY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = by.get_or_insert_with(Default::default);
+    let entry = map.entry((at.file(), at.line())).or_default();
+    entry.0 += 1;
+    entry.1 += size;
+    let n: u64 = map.values().map(|v| v.0).sum();
+    if n.is_multiple_of(20_000) {
+        let mut top: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        top.sort_by_key(|t| std::cmp::Reverse(t.1.0));
+        let said: Vec<String> = top
+            .iter()
+            .take(8)
+            .map(|((file, line), (count, bytes))| format!("{file}:{line} {count} ({} MB)", bytes >> 20))
+            .collect();
+        tracing::info!("shared buffers made so far by line ({n} in all): {}", said.join(", "));
+    }
+}
+
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -2375,6 +2400,11 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// Upload buffers taken from the pool of shared buffers
+    /// ([`upload_pool`]), with their mapped bytes and their size: given back
+    /// to it when the list is reset (counted in `uploads`' place in
+    /// [`ALIVE`]).
+    pooled: Vec<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2440,9 +2470,32 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[6].fetch_sub((self.uploads.len() + self.pooled.len()) as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // A list is reset only once its last submission has run
+        // (`HostList::reset`): a buffer nothing else holds is read by no one.
+        // The steps go first: a fill names the buffer it fills.
+        if !self.pooled.is_empty() {
+            self.copies.clear();
+        }
+        for (buffer, data, size) in self.pooled.drain(..) {
+            if references(&buffer) == 1 {
+                crate::shadow::view_pool_put(size, &buffer, data as *mut u8);
+            }
+        }
     }
+}
+
+/// Whether a list's upload buffers in shared memory (with
+/// `VICTORY_CARD_STEPS` 2 or more, one a copy: `HostList::upload`) come from
+/// the pool the copies of buffer views use (`shadow::view_pool`) and go back
+/// to it when the list is reset (`VICTORY_UPLOAD_POOL=1`; off by default).
+/// With the views' pool on, they were the most made buffers left: 23,000 of
+/// 40,000, 1.1 GB, each waited for until it is mapped (run 4 of 2026-11-27).
+/// Buffers up to 16 MiB.
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1"))
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -7213,8 +7266,23 @@ impl HostList {
     /// reset.
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
+        if card_steps::stage() > 1 && upload_pool() && size <= 16 << 20 {
+            let class = crate::shadow::view_pool_size(size);
+            let (buffer, data) = match crate::shadow::view_pool_take(class) {
+                Some(taken) => taken,
+                None => host.shared_buffer(class)?,
+            };
+            name(&buffer, || format!("list upload {size:#x}"));
+            let mut deferred = self.deferred();
+            ALIVE[6].fetch_add(1, Ordering::Relaxed);
+            ALIVE[7].fetch_add(class, Ordering::Relaxed);
+            deferred.upload_bytes += class;
+            deferred.pooled.push((buffer.clone(), data as usize, class));
+            return Some((buffer, data));
+        }
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
@@ -9842,9 +9910,12 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[cfg_attr(feature = "diagnostics", track_caller)]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        shared_buffer_caller(std::panic::Location::caller(), size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
@@ -11175,3 +11246,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::{card_steps, host, upload_pool};
+
+    #[test]
+    #[ignore = "requires D3D12 hardware, VICTORY_CARD_STEPS=2 and VICTORY_UPLOAD_POOL=1"]
+    fn only_released_uploads_return_to_the_pool_on_reset() {
+        assert!(card_steps::stage() > 1 && upload_pool());
+        let host = host().expect("D3D12 host");
+        let list = host.new_list().expect("host list");
+        let (retained, retained_data) = list.upload(host, 4096).expect("first upload");
+        list.close();
+        list.reset();
+
+        let (released, released_data) = list.upload(host, 8192).expect("second upload");
+        assert_ne!(retained, released, "the first upload remains in use");
+        assert_ne!(retained_data, released_data);
+        drop(released);
+        list.close();
+        list.reset();
+
+        let (_reused, reused_data) = list.upload(host, 4096).expect("reused upload");
+        assert_eq!(reused_data, released_data, "the second upload's mapping is reused");
+        // SAFETY: the returned shared upload is mapped and at least 4096 bytes long.
+        unsafe {
+            reused_data.write(0x73);
+            assert_eq!(reused_data.read(), 0x73);
+        }
+        eprintln!("upload pool reused only the released mapping after list reset");
+    }
+}
