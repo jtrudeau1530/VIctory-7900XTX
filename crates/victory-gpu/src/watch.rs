@@ -738,6 +738,52 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     spent.end();
 }
 
+/// Records a range that no earlier single range contains. Starts and ends
+/// both increase in the map, so the last start at or before `first` has the
+/// farthest end there. Removing contained entries keeps that property
+/// without changing the order or contents of the actual kernel requests.
+fn record_uncovered(earlier: &mut BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    if earlier.range(..=first).next_back().is_some_and(|(_, &end)| end >= last) {
+        return false;
+    }
+    while let Some((&start, &end)) = earlier.range(first..).next() {
+        if end > last {
+            break;
+        }
+        earlier.remove(&start);
+    }
+    earlier.insert(first, last);
+    true
+}
+
+#[derive(Default)]
+struct RestRanges {
+    requests: Vec<(usize, usize)>,
+    earlier: Option<BTreeMap<usize, usize>>,
+}
+
+impl RestRanges {
+    fn note(&mut self, first: usize, last: usize, remaining: usize) {
+        // Small batches and heavily contained ranges are faster to scan.
+        // Build the index only with enough prior and remaining requests.
+        const INDEX_AT: usize = 128;
+        if self.earlier.is_none() && self.requests.len() >= INDEX_AT && remaining >= INDEX_AT {
+            let mut earlier = BTreeMap::new();
+            for &(first, last) in &self.requests {
+                record_uncovered(&mut earlier, first, last);
+            }
+            self.earlier = Some(earlier);
+        }
+        let uncovered = match &mut self.earlier {
+            Some(earlier) => record_uncovered(earlier, first, last),
+            None => !self.requests.iter().any(|&(start, end)| start <= first && last <= end),
+        };
+        if uncovered {
+            self.requests.push((first, last));
+        }
+    }
+}
+
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
@@ -753,18 +799,19 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
     // Those not held by an asking ahead, each once.
-    let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut alone = RestRanges::default();
     let mut held_ahead = Ahead::new();
     held_ahead.set(std::mem::take(&mut ahead));
-    for &(start, end) in ranges {
+    for (i, &(start, end)) in ranges.iter().enumerate() {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !held_ahead.holds(first, last) && !alone_ranges.iter().any(|&(a, b)| a <= first && last <= b) {
-            alone_ranges.push((first, last));
+        if !held_ahead.holds(first, last) {
+            alone.note(first, last, ranges.len() - i);
         }
     }
+    let alone_ranges = alone.requests;
     let mut ahead = held_ahead.take();
     let answers = spread_each(alone_ranges.len(), |r| {
         let (first, last) = alone_ranges[r];
@@ -3349,6 +3396,32 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn individual_earlier_ranges_determine_which_queries_are_needed() {
+        let input = [(8, 10), (4, 7), (5, 9), (4, 9), (6, 8), (8, 12), (4, 12), (4, 9), (4, 13)];
+        let mut earlier = BTreeMap::new();
+        let due: Vec<_> = input.into_iter().filter(|&(a, b)| record_uncovered(&mut earlier, a, b)).collect();
+        assert_eq!(due, [(8, 10), (4, 7), (5, 9), (4, 9), (8, 12), (4, 12), (4, 13)]);
+        assert_eq!(earlier.into_iter().collect::<Vec<_>>(), [(4, 13)]);
+    }
+
+    #[test]
+    fn a_larger_batch_keeps_the_same_request_order_after_indexing() {
+        let mut input: Vec<_> = (0..180).rev().map(|i| (i * 4, i * 4 + 2)).collect();
+        input.extend([(300, 420), (315, 330), (280, 316), (280, 420)]);
+        input.extend((180..400).map(|i| (i * 4, i * 4 + 2)));
+        let mut expected = Vec::new();
+        let mut rest = RestRanges::default();
+        for (i, &(first, last)) in input.iter().enumerate() {
+            if !expected.iter().any(|&(start, end)| start <= first && last <= end) {
+                expected.push((first, last));
+            }
+            rest.note(first, last, input.len() - i);
+        }
+        assert!(rest.earlier.is_some());
+        assert_eq!(rest.requests, expected);
+    }
 
     #[test]
     fn ranges_asked_ahead_hold_what_lies_in_one_of_them() {
