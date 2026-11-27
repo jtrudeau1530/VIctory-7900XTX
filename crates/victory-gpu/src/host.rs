@@ -5009,7 +5009,7 @@ impl Host {
             land::count(land::stat::JOBS, jobs.len() as u64);
             written = put.into_inner();
         } else {
-            let mut title = Vec::new();
+            let (mut title, mut was) = (Vec::new(), Vec::new());
             for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
                 if let Some(check) = &check {
                     // SAFETY: as below.
@@ -5018,7 +5018,7 @@ impl Host {
                 // SAFETY: the mapping of the fetched bytes, `total` of them;
                 // the copy into it has run.
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title, &mut was);
                 shadow.walls_merged(gpu.len(), merged);
                 written += merged as u64;
             }

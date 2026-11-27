@@ -4633,7 +4633,7 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
-    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>, was: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -4663,18 +4663,25 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let was = title.clone();
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+        if mapped {
+            was.clone_from(title);
         }
+        // Even without a mapped title address, retain the latest card bytes
+        // in the CPU's reference. In that case `title` is only scratch.
+        let changed = if skip.is_empty() {
+            merge_piece(gpu, held, title)
+        } else {
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, skip) {
+                let (a, b) = (a - at, b - at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            changed
+        };
         if !mapped || !changed {
             return 0;
         }
-        put_changed(start + at, &was, title)
+        put_changed(start + at, was, title)
     }
 }
 
@@ -4918,6 +4925,10 @@ mod land_tests {
                         }
                     }
                 }
+                if round % 2 == 0 {
+                    dirty.clear();
+                    sent.clear();
+                }
                 let after = 4u64;
                 for (shadow, at) in [(&one, a), (&many, b)] {
                     crate::watch::writing(at, LEN);
@@ -4928,9 +4939,9 @@ mod land_tests {
                     *card.sent.lock().unwrap() = super::SentRuns::of(&sent);
                 }
                 let pieces: Vec<(usize, usize)> = (0..3).map(|p| (p * PIECE + 16, (p + 1) * PIECE - 4)).collect();
-                let mut scratch = Vec::new();
+                let (mut scratch, mut was) = (Vec::new(), Vec::new());
                 for &(lo, hi) in &pieces {
-                    one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch);
+                    one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch, &mut was);
                 }
                 let addressed: Vec<(usize, usize, usize)> =
                     pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
@@ -4942,6 +4953,7 @@ mod land_tests {
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
             }
         }
+        eprintln!("verified 80 relay landing pairs");
     }
 
     /// Landings of one copy on several threads, the title writing dwords of
