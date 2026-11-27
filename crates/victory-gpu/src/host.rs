@@ -4815,7 +4815,7 @@ impl Host {
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = std::collections::HashSet::<_, std::hash::BuildHasherDefault<AddressHash>>::default();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
