@@ -343,6 +343,26 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// A recorder can take its frame number, then reach the budget lock out of order.
+fn reserve_wait(
+    spent: &mut (u64, Duration),
+    frame: u64,
+    budget: Duration,
+    shared: bool,
+) -> Duration {
+    if frame < spent.0 {
+        return Duration::ZERO;
+    }
+    if frame > spent.0 {
+        *spent = (frame, Duration::ZERO);
+    }
+    let left = budget.saturating_sub(spent.1);
+    if shared {
+        spent.1 += left;
+    }
+    left
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -352,19 +372,12 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((0, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        reserve_wait(&mut spent, frame, budget, shared)
     };
     if left.is_zero() {
         return;
@@ -625,6 +638,27 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_pipeline_wait_keeps_newer_frame_budget() {
+        use super::reserve_wait;
+        let budget = Duration::from_millis(500);
+        for shared in [false, true] {
+            let mut spent = (0, Duration::ZERO);
+            assert_eq!(reserve_wait(&mut spent, 0, budget, shared), budget);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget);
+            // In non-shared mode a completed wait, rather than its
+            // reservation, charges the budget.
+            if !shared {
+                spent.1 = Duration::from_millis(250);
+            }
+            let before = spent;
+            assert_eq!(reserve_wait(&mut spent, 7, budget, shared), Duration::ZERO);
+            assert_eq!(spent, before);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget - before.1);
+            assert_eq!(reserve_wait(&mut spent, 9, budget, shared), budget);
+        }
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
