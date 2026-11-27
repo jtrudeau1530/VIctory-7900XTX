@@ -51,7 +51,8 @@ pub(crate) struct Job {
     staging: Arc<Staging>,
     copy: Arc<HostTexture>,
     asked: std::time::Instant,
-    /// What to do when it has run; `None`: it has.
+    /// Callbacks pending until the worker finishes; then `copy.ahead`
+    /// stays DONE on success or LISTED on failure for this host copy.
     then: Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>,
 }
 
@@ -60,11 +61,12 @@ impl Job {
     pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
         match then.as_mut() {
-            Some(then) => then.push(Box::new(f)),
-            None => {
+            Some(callbacks) => callbacks.push(Box::new(f)),
+            None if self.copy.ahead.load(Relaxed) == DONE => {
                 drop(then);
                 f();
             }
+            None => {}
         }
     }
 }
@@ -230,18 +232,27 @@ impl Worker {
                     jobs.push(job);
                 }
             }
-            value += 1;
-            if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
+            let failed: Vec<_> = jobs.extract_if(.., |job| {
+                job.staging.refresh();
+                // An entirely unmapped source can skip conversion altogether.
+                job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).conversion
+                    != super::Conversion::Ready
+            }).collect();
+            if !failed.is_empty() {
+                finish(failed, false);
             }
-            finish(jobs);
+            if !jobs.is_empty() {
+                value += 1;
+                let result = self.copy(&jobs, value);
+                if let Err(e) = &result {
+                    tracing::warn!(error = %e, "uploads ahead did not run");
+                }
+                finish(jobs, result.is_ok());
+            }
         }
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
-        }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
@@ -286,13 +297,16 @@ impl Job {
     }
 }
 
-/// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
+/// Release all jobs and wake lists waiting on them. Only a completed copy
+/// can show its slots. Failed jobs leave later uploads to the list path.
+fn finish(jobs: Vec<Arc<Job>>, copied: bool) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
-        job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        if copied {
+            job.staging.uploaded.store(true, Relaxed);
+            job.staging.dirty.store(false, Relaxed);
+            job.staging.note_held();
+        }
+        job.copy.ahead.store(if copied { DONE } else { LISTED }, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     {
@@ -301,6 +315,10 @@ fn finish(jobs: Vec<Arc<Job>>) {
         LANDED.notify_all();
     }
     for job in &jobs {
+        let callbacks = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if !copied {
+            continue;
+        }
         let us = job.asked.elapsed().as_micros() as u64;
         let n = STATS[0].fetch_add(1, Relaxed) + 1;
         let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;
@@ -316,12 +334,13 @@ fn finish(jobs: Vec<Arc<Job>>) {
                 STATS[5].load(Relaxed)
             );
         }
-        let then = job.then.lock().unwrap_or_else(|e| e.into_inner()).take();
-        for f in then.into_iter().flatten() {
+        for f in callbacks.into_iter().flatten() {
             f();
         }
     }
-    crate::descriptor::host::flip_now();
+    if copied {
+        crate::descriptor::host::flip_now();
+    }
 }
 
 /// Whether `resource`'s host copy was filled here: no list still brings what
@@ -338,6 +357,42 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unmapped_source_stays_available_to_the_direct_upload_path() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // The placed resource stays registered for the process. Reserve its
+        // address without committing any of its pages.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("upload not taken") };
+        let (told, heard) = std::sync::mpsc::channel();
+        job.then(move || told.send(()).unwrap());
+        send(&job);
+        listed(&job.copy);
+        assert_eq!(
+            heard.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        );
+        assert_eq!(job.copy.ahead.load(Relaxed), LISTED);
+        assert!(!job.staging.uploaded.load(Relaxed));
+
+        // Once the address becomes readable the normal refresh can stage it.
+        let committed = unsafe { VirtualAlloc(at, whole, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed, at);
+        unsafe { std::ptr::write_bytes(at.cast::<u8>(), 0x54, whole) };
+        job.staging.refresh();
+        assert!(job.staging.last.lock().unwrap().conversion == super::super::Conversion::Ready);
+        assert!(!job.staging.uploaded.load(Relaxed));
+        eprintln!("unmapped ahead source deferred and then staged after commit");
+    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the
