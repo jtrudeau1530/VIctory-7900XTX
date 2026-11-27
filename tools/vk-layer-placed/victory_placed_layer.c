@@ -130,15 +130,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(VkPhysicalDevice pd, co
     }
     static const char *want[] = { VK_KHR_MAP_MEMORY_2_EXTENSION_NAME, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME };
     int can = avail && has_ext(avail, navail, want[0]) && has_ext(avail, navail, want[1]);
+    free(avail);
 
     VkDeviceCreateInfo nci = *ci;
-    const char **exts = calloc(ci->enabledExtensionCount + 2, sizeof *exts);
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) exts[n++] = ci->ppEnabledExtensionNames[i];
+    const char **exts = NULL;
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT feat = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
         .memoryMapPlaced = VK_TRUE, .memoryMapRangePlaced = VK_FALSE, .memoryUnmapReserve = VK_TRUE };
+    int chained = 0;
     if (can) {
+        PFN_vkGetPhysicalDeviceFeatures2 query =
+            (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT supported = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT };
+        VkPhysicalDeviceFeatures2 features = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supported };
+        if (query) query(pd, &features);
+        can = supported.memoryMapPlaced && supported.memoryUnmapReserve;
+        for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext) {
+            if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) continue;
+            const VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *requested =
+                (const VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *)s;
+            can = can && requested->memoryMapPlaced && requested->memoryUnmapReserve;
+            chained = 1;
+        }
+    }
+    if (can) {
+        if (ci->enabledExtensionCount > UINT32_MAX - 2) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        exts = calloc(ci->enabledExtensionCount + 2, sizeof *exts);
+        if (!exts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) exts[n++] = ci->ppEnabledExtensionNames[i];
         for (int w = 0; w < 2; w++) {
             int found = 0;
             for (uint32_t i = 0; i < n; i++) if (!strcmp(exts[i], want[w])) found = 1;
@@ -146,19 +168,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(VkPhysicalDevice pd, co
         }
         nci.enabledExtensionCount = n;
         nci.ppEnabledExtensionNames = exts;
-        /* Feature struct: force on if the app chained one, else chain ours. */
-        VkBaseOutStructure *s = (VkBaseOutStructure *)ci->pNext; int chained = 0;
-        for (; s; s = s->pNext)
-            if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) {
-                ((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *)s)->memoryMapPlaced = VK_TRUE;
-                ((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *)s)->memoryUnmapReserve = VK_TRUE;
-                chained = 1;
-            }
+        /* Keep the application's feature records unchanged. */
         if (!chained) { feat.pNext = (void *)nci.pNext; nci.pNext = &feat; }
     } else {
-        LOG("vkCreateDevice: GPU lacks map_memory2/map_memory_placed; passing through\n");
+        LOG("vkCreateDevice: placed mapping features unavailable or unrequested; passing through\n");
     }
-    free(avail);
 
     VkResult r = next_create(pd, &nci, alloc, out);
     free(exts);
