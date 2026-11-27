@@ -1007,6 +1007,22 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    {
+        let len = now.len().min(held.len()).min(title.len());
+        if len >= 64 && std::arch::is_x86_feature_detected!("avx2") {
+            let (now, held, title) = (&now[..len], &mut held[..len], &mut title[..len]);
+            if now == &*held {
+                return false;
+            }
+            // SAFETY: AVX2 is available and the slices cover the same prefix.
+            return unsafe { merge_piece_avx2(now, held, title) };
+        }
+    }
+    merge_piece_scalar(now, held, title)
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -1016,6 +1032,31 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+    let (now, now_tail) = now.as_chunks::<32>();
+    let (held, held_tail) = held.as_chunks_mut::<32>();
+    let (title, title_tail) = title.as_chunks_mut::<32>();
+    let mut differs = _mm256_setzero_si256();
+    for ((now, held), title) in now.iter().zip(held).zip(title) {
+        // SAFETY: every load and store covers one full 32-byte chunk.
+        unsafe {
+            let next = _mm256_loadu_si256(now.as_ptr().cast());
+            let before = _mm256_loadu_si256(held.as_ptr().cast());
+            let current = _mm256_loadu_si256(title.as_ptr().cast());
+            let unchanged = _mm256_cmpeq_epi8(next, before);
+            let merged = _mm256_blendv_epi8(next, current, unchanged);
+            differs = _mm256_or_si256(differs, _mm256_xor_si256(merged, current));
+            _mm256_storeu_si256(title.as_mut_ptr().cast(), merged);
+            _mm256_storeu_si256(held.as_mut_ptr().cast(), next);
+        }
+    }
+    let tail_changed = merge_piece_scalar(now_tail, held_tail, title_tail);
+    _mm256_testz_si256(differs, differs) == 0 || tail_changed
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1043,7 +1084,7 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, merge_piece_scalar, outside};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -1100,6 +1141,20 @@ mod relay_tests {
         let (title1, held1) = (title.clone(), held.clone());
         assert!(!merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
+    }
+
+    #[test]
+    fn long_merges_match_the_scalar_prefix() {
+        for (n, h, t) in [(64, 64, 64), (65, 64, 67), (97, 128, 99), (130, 131, 129)] {
+            let now: Vec<_> = (0..n).map(|i| (i * 13 + i / 17) as u8).collect();
+            let original: Vec<_> = (0..h).map(|i| (i * 13 + i / 19) as u8).collect();
+            let title: Vec<_> = (0..t).map(|i| (i * 11 + 5) as u8).collect();
+            let (mut left_held, mut left_title) = (original.clone(), title.clone());
+            let (mut right_held, mut right_title) = (original, title);
+            let left = merge_piece_scalar(&now, &mut left_held, &mut left_title);
+            let right = merge_piece(&now, &mut right_held, &mut right_title);
+            assert_eq!((left, left_held, left_title), (right, right_held, right_title));
+        }
     }
 
     #[test]
