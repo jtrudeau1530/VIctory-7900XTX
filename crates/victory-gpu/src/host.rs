@@ -3840,6 +3840,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+pub(crate) mod buffer_ahead;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
@@ -9077,6 +9078,7 @@ impl Meter {
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
             crate::shadow::exact_line(frames);
+            buffer_ahead::report();
             crate::descriptor::sync_line(frames);
             late_line(frames);
             crate::queue::behind_line(frames);
@@ -9836,6 +9838,11 @@ impl Host {
             shared[2] >> 20,
             shared[3] >> 20
         );
+    }
+
+    /// The shared host allocation for a newly used title buffer.
+    pub(crate) fn title_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        buffer_ahead::take(size).or_else(|| self.shared_buffer(size))
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
