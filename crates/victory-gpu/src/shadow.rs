@@ -1356,7 +1356,7 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{PIECE, Shadow, first_difference, last_difference};
 
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
@@ -1392,6 +1392,31 @@ mod difference_tests {
         b[64] = 1;
         assert_eq!(first_difference(&b, &a), Some(32));
         assert_eq!(last_difference(&a, &b), Some(64));
+    }
+
+    #[test]
+    fn a_big_compare_finds_changes_in_its_first_slice() {
+        let Some(host) = crate::host::host() else { return };
+        let (buffer, _) = host.upload_buffer(256).expect("a live host resource");
+        const LEN: usize = 48 << 20;
+        let before = vec![0u8; LEN];
+        let mut copy = before.clone();
+        let changed = [0, 100, PIECE - 1, PIECE + 5, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for at in changed {
+            copy[at] = 1;
+        }
+        // A synthetic title address half a piece in. The compare only reads `copy` and `before`.
+        let start = 0x0012_3456_8000u64;
+        let shadow = Shadow::new(buffer, copy.as_mut_ptr(), 0, start, LEN as u64);
+        let found = shadow.differing(0, LEN, &before);
+        for at in changed {
+            assert!(found.iter().any(|&(lo, len)| (lo..lo + len).contains(&at)), "missed byte {at}");
+        }
+        for (lo, len) in found {
+            assert!(changed.iter().any(|&at| (lo..lo + len).contains(&at)));
+            assert!((start as usize + lo + len).is_multiple_of(PIECE) || lo + len == LEN);
+        }
+        eprintln!("parallel compare regression exercised the first slice");
     }
 }
 
@@ -3541,7 +3566,8 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // The piece containing the first byte can start before the copy.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
