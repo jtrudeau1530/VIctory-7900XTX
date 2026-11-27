@@ -3824,9 +3824,13 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 }
 
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
-/// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
-/// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// do not begin on 16 bytes, are left null, or use the driver's exact dword offset.
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn twin_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_some_and(|v| v == "1"))
+}
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -3885,6 +3889,17 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
         TWINS[1].fetch_add(1, Relaxed);
     }
     Some((from / 4, dwords, (start - from) as u32))
+}
+
+/// RADV can address a raw view at any dword. Keep the staged byte relocation
+/// path for sub-dword offsets and for hosts that require 16-byte alignment.
+fn exact_twin_window((first, count, by): (u64, u32, u32)) -> (u64, u32, u32) {
+    if by == 0 || !by.is_multiple_of(4) || !twin_exact() {
+        return (first, count, by);
+    }
+    let dwords = by / 4;
+    TWINS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (first + u64::from(dwords), count - dwords, 0)
 }
 
 fn buffer_srv(
@@ -3963,7 +3978,7 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     if let Some(twin) = twin {
-        let window = twin_window(desc.Format, first, count, stride, raw, width);
+        let window = twin_window(desc.Format, first, count, stride, raw, width).map(exact_twin_window);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
@@ -3973,14 +3988,12 @@ fn buffer_srv(
                 Flags: D3D12_BUFFER_SRV_FLAG_RAW,
             };
             // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
+            unsafe {
                 host.device
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
-                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                null_buffer_view(twin);
+            if by > 0 {
+                finish_twin(twin, &shadow.buffer, first, count, by);
             }
         } else {
             null_buffer_view(twin);
@@ -4086,7 +4099,7 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     if let Some(twin) = twin {
-        let window = twin_window(desc.Format, first, count, stride, raw, width);
+        let window = twin_window(desc.Format, first, count, stride, raw, width).map(exact_twin_window);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
@@ -4097,20 +4110,27 @@ fn buffer_uav(
                 Flags: D3D12_BUFFER_UAV_FLAG_RAW,
             };
             // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
+            unsafe {
                 host.device
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
-                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                null_buffer_view(twin);
+            if by > 0 {
+                finish_twin(twin, &shadow.buffer, first, count, by);
             }
         } else {
             null_buffer_view(twin);
         }
     }
     Some(Some(shadow.buffer.clone()))
+}
+
+fn finish_twin(twin: D3D12_CPU_DESCRIPTOR_HANDLE, buffer: &ID3D12Resource, first: u64, count: u32, by: u32) {
+    // SAFETY: the descriptor still refers to this live buffer.
+    let start = unsafe { buffer.GetGPUVirtualAddress() } + first * 4;
+    if !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+        TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        null_buffer_view(twin);
+    }
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -5330,6 +5350,119 @@ mod tests {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    #[test]
+    #[ignore = "requires RADV with VICTORY_TWIN_EXACT=1 and VICTORY_CARD_BUFFERS=0"]
+    fn exact_raw_twins_read_and_write_at_every_dword_offset() {
+        use windows::core::s;
+
+        assert!(twin_exact(), "set VICTORY_TWIN_EXACT=1");
+        assert_eq!(
+            twin_window(DXGI_FORMAT_R16_UINT, 1, 4, 0, false, 16).map(exact_twin_window),
+            Some((0, 3, 2)),
+            "a sub-dword view still needs staged relocation"
+        );
+        assert_eq!(
+            twin_window(DXGI_FORMAT_R32_UINT, 3, 1, 0, false, 16).map(exact_twin_window),
+            Some((3, 1, 0))
+        );
+
+        let host = host().expect("a D3D12 device");
+        let code = crate::host::compile(
+            r#"
+                ByteAddressBuffer src : register(t0);
+                RWByteAddressBuffer dst : register(u0);
+                [RootSignature("DescriptorTable(SRV(t0), UAV(u0))")]
+                [numthreads(1, 1, 1)]
+                void main() { dst.Store2(0, src.Load2(0)); }
+            "#,
+            s!("main"),
+            s!("cs_5_1")
+        ).expect("compile the raw view copy");
+
+        // SAFETY: the shader bytecode and root signature live through PSO creation.
+        let (root, pipeline, heap, slots) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let pipeline: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            }).unwrap();
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            }).unwrap();
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+            let slots = [0, 1, 2, 3].map(|i| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i * step });
+            (root, pipeline, heap, slots)
+        };
+
+        const WORDS: usize = 16;
+        let src = Box::new(std::array::from_fn::<_, WORDS, _>(|i| 0x9012_3450 + i as u32));
+        let dst = Box::new([0xdeaf_beefu32; WORDS]);
+        let (a, b) = (src.as_ptr() as u64, dst.as_ptr() as u64);
+        let bytes = size_of_val(&*src) as u64;
+        crate::shadow::register(a as usize, a, bytes);
+        crate::shadow::register(b as usize, b, bytes);
+
+        for offset in 1..4 {
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset as u64, NumElements: 2, ..Default::default()
+                }},
+            };
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: offset as u64, NumElements: 2, ..Default::default()
+                }},
+            };
+            let input = buffer_srv(a, bytes, srv, slots[2], Some(slots[0])).flatten().unwrap();
+            let output = buffer_uav(b, bytes, uav, slots[3], Some(slots[1])).flatten().unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: both live, CPU-visible buffers cover the full word array.
+            // No GPU work references them until submission.
+            unsafe {
+                for (resource, words) in [(&input, &src), (&output, &dst)] {
+                    let mut data = std::ptr::null_mut();
+                    resource.Map(0, None, Some(&mut data)).unwrap();
+                    std::ptr::copy_nonoverlapping(words.as_ptr(), data.cast::<u32>(), WORDS);
+                    resource.Unmap(0, None);
+                }
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pipeline);
+                list.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut expected = *dst;
+            expected[offset..offset + 2].copy_from_slice(&src[offset..offset + 2]);
+            // SAFETY: the completed list wrote into this mapped buffer.
+            let actual = unsafe {
+                let mut data = std::ptr::null_mut();
+                output.Map(0, None, Some(&mut data)).unwrap();
+                let actual = data.cast::<[u32; WORDS]>().read();
+                output.Unmap(0, None);
+                actual
+            };
+            assert_eq!(actual, expected, "raw twin at byte offset {}", offset * 4);
+        }
+        crate::shadow::unregister(b as usize, b);
+        crate::shadow::unregister(a as usize, a);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        println!("raw twin SRV loads and UAV stores agree at 4, 8 and 12 bytes");
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
