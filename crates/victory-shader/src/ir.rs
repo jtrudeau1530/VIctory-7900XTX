@@ -178,7 +178,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let mut fields = machine.fields(wave64);
+        let mut fields = semantic_fields(&machine, name, wave64);
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
@@ -236,6 +236,26 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
+}
+
+/// Normalize a constant lane before any pass tries to match a write to a read.
+fn semantic_fields(inst: &gfx10::Instruction, name: &str, wave64: bool) -> Fields {
+    let mut fields = inst.fields(wave64);
+    if matches!(name, "v_readlane_b32" | "v_writelane_b32")
+        && let Fields::Valu(v) = &mut fields
+        && let Some(lane) = v.src.get_mut(1)
+    {
+        let constant = match *lane {
+            Operand::Const(code) => crate::resource::inline(code),
+            Operand::Literal(value) => Some(value),
+            _ => None,
+        };
+        if let Some(value) = constant {
+            let mask = if wave64 { 63 } else { 31 };
+            *lane = Operand::Const(128 + (value & mask) as u8);
+        }
+    }
+    fields
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
@@ -304,7 +324,7 @@ fn unspill(
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
-        let fields = inst.fields(wave64);
+        let fields = semantic_fields(inst, name, wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             return Vec::new();
@@ -1860,6 +1880,24 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn rdna2_unspill_tracks_aliased_constant_lanes() {
+        let words = [
+            0xD761_0005, (164 << 9) | 2,   // v_writelane_b32 v5, s2, 36
+            0xD761_0005, (132 << 9) | 3,   // v_writelane_b32 v5, s3, 4
+            0xD760_000C, (164 << 9) | 261, // v_readlane_b32 s12, v5, 36
+            S_ENDPGM,
+        ];
+        for wave64 in [false, true] {
+            let p = build_words(&words, wave64);
+            let insts = &p.blocks[0].insts;
+            let latest = if wave64 { 0 } else { 1 };
+            let (slot, saved) = insts[latest].writes[0];
+            assert_eq!(insts[2].name(), "s_mov_b32");
+            assert_eq!(insts[2].read(slot), Some(saved));
+        }
     }
 
     /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what
