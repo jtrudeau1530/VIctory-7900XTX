@@ -369,6 +369,8 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Immutable SRVs, one per slice and mip of this twin, shared by recorded lists.
+    pub(crate) plane_views: std::sync::OnceLock<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
 }
 
 #[cfg(windows)]
@@ -586,6 +588,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_views: std::sync::OnceLock::new(),
     }))
 }
 
@@ -4185,6 +4188,21 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        check_depth_plane_after_later_lists(0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_planes_twin_survives_the_descriptor_ring_boundary() {
+        // The previous heap had 256 slots. The first pending list and 255
+        // later passes fill the ring, then the next pass reuses its slot.
+        for later_count in [255, 256] {
+            check_depth_plane_after_later_lists(later_count);
+        }
+    }
+
+    #[cfg(windows)]
+    fn check_depth_plane_after_later_lists(later_count: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -4230,14 +4248,6 @@ mod tests {
         const CLASSES: [u16; 16] = [
             8, 65, 128, 129, 65, 8, 129, 128, 0, 255, 65, 64, 129, 130, 8, 65,
         ];
-        let mut pattern = vec![0u8; 1024];
-        for (i, class) in CLASSES.into_iter().enumerate() {
-            let at = i / 4 * 256 + i % 4 * 2;
-            pattern[at..at + 2].copy_from_slice(&class.to_le_bytes());
-        }
-        let (upload, data) = host.upload_buffer(1024).unwrap();
-        // SAFETY: the buffer's mapping, 1024 bytes.
-        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
         let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: kind,
@@ -4347,24 +4357,59 @@ mod tests {
         );
         let moved = crate::host::transition;
 
-        // The class numbers into the twin, where a shader would write them.
-        let fill = host.new_list().unwrap();
-        // SAFETY: an open list and live resources.
-        unsafe {
-            let l = &fill.list;
-            l.ResourceBarrier(&[moved(plane, written, dest)]);
-            l.CopyTextureRegion(&whole(plane), 0, 0, 0, &rows(&upload, rows_of(53)), None);
-            l.ResourceBarrier(&[moved(plane, dest, written)]);
-        }
-        fill.close();
-        host.execute(&[&fill]);
+        // Fill the twin just as a preceding shader pass would.
+        let fill_plane = |plane: &ID3D12Resource, classes: [u16; 16]| {
+            let mut pattern = [0u8; 1024];
+            for (i, class) in classes.into_iter().enumerate() {
+                let at = i / 4 * 256 + i % 4 * 2;
+                pattern[at..at + 2].copy_from_slice(&class.to_le_bytes());
+            }
+            let (upload, data) = host.upload_buffer(1024).unwrap();
+            let fill = host.new_list().unwrap();
+            // SAFETY: a live 1024-byte mapping and live list resources.
+            unsafe {
+                std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, pattern.len());
+                let l = &fill.list;
+                l.ResourceBarrier(&[moved(plane, written, dest)]);
+                l.CopyTextureRegion(&whole(plane), 0, 0, 0, &rows(&upload, rows_of(53)), None);
+                l.ResourceBarrier(&[moved(plane, dest, written)]);
+            }
+            fill.close();
+            host.execute(&[&fill]);
+        };
+        fill_plane(plane, CLASSES);
 
-        // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane.
-        let list = host.new_list().unwrap();
-        assert!(list.twin_use(depth, true, true));
-        list.twins_written();
-        list.close();
+        let record = |texture| {
+            let list = host.new_list().unwrap();
+            assert!(list.twin_use(texture, true, true));
+            list.twins_written();
+            list.close();
+            list
+        };
+        let list = record(depth);
+        let mut separate_depth = null;
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &desc, DEPTH_WRITE, null.cast(),
+                &RESOURCE_IIDS[0], &mut separate_depth,
+            ),
+            S_OK,
+        );
+        if later_count == 0 {
+            let other = record(depth);
+            let separate = record(separate_depth);
+            let heaps = list.kept_shader_heaps();
+            assert_eq!(heaps.len(), 1);
+            assert_eq!(other.kept_shader_heaps(), heaps, "the same twin can reuse its immutable views");
+            let separate_heaps = separate.kept_shader_heaps();
+            assert_eq!(separate_heaps.len(), 1);
+            assert_ne!(separate_heaps[0], heaps[0], "different twins need independent SRVs");
+        } else {
+            // If the first list reads this twin, all 16 texels invert.
+            let opposite = CLASSES.map(|class| if matches!(class, 65 | 129) { 8 } else { 65 });
+            fill_plane(twin_plane_resource(separate_depth).unwrap(), opposite);
+        }
+        let later: Vec<_> = (0..later_count).map(|_| record(separate_depth)).collect();
         host.execute(&[&list]);
 
         // The draws: a triangle over the target at the depth of a class,
@@ -4489,11 +4534,12 @@ float4 lit() : SV_Target { return 1.0; }
                 .unwrap();
             std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
         };
-        for (i, class) in CLASSES.into_iter().enumerate() {
-            let covered = read[i / 4 * 256 + i % 4] != 0;
-            let drawn = matches!(class, 65 | 129);
-            assert_eq!(covered, drawn, "texel {i}, class {class}");
-        }
+        let expected = CLASSES.map(|class| if matches!(class, 65 | 129) { 255 } else { 0 });
+        let actual: [u8; 16] = std::array::from_fn(|i| read[i / 4 * 256 + i % 4]);
+        drop(later);
+        resource_release(separate_depth);
+        assert_eq!(actual, expected, "first depth plane after {later_count} later lists");
+        eprintln!("verified all 16 depth texels after {later_count} later lists");
     }
 
     #[test]
