@@ -1,0 +1,18 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_VICTORY_placed",
+        "type": "GLOBAL",
+        "library_path": "@LIBRARY_PATH@",
+        "api_version": "1.4.357",
+        "implementation_version": "1",
+        "description": "VIctory: enable VK_EXT_map_memory_placed + map_memory2 on every device (only with ENABLE_VICTORY_PLACED=1)",
+        "functions": {
+            "vkNegotiateLoaderLayerInterfaceVersion": "victory_placed_NegotiateLoaderLayerInterfaceVersion",
+            "vkGetInstanceProcAddr": "victory_placed_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "victory_placed_GetDeviceProcAddr"
+        },
+        "enable_environment": { "ENABLE_VICTORY_PLACED": "1" },
+        "disable_environment": { "DISABLE_VICTORY_PLACED": "1" }
+    }
+}

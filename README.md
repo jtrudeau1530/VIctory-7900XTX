@@ -79,6 +79,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
 | `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
+| `VICTORY_PORT_PLACED=1` | With `VICTORY_PORT_CONSTANTS=1`: the title's 32-bit graphics reservation is a heap of the card's, mapped at the title's address (RX 7900 XT, walking route: 19.2-19.9 fps against 18.5, CPU prep 24 ms against 33; 1 heaps placed at the title's address (185 MB), 0 fallbacks). On Linux it needs the layer in [tools/vk-layer-placed](tools/vk-layer-placed/README.md) and `ENABLE_VICTORY_PLACED=1`; not tested on Windows |
 
 ### Other switches
 
