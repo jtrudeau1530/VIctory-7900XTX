@@ -3,8 +3,8 @@
 //! protection, write-watch asking, mapping and guard fault takes too: half
 //! a millisecond a question while the title streams (speed-wine-20261125).
 //!
-//! Each site's questions are counted with their time, always (two relaxed
-//! adds), and said once per frame-rate line ([`line`]).
+//! The diagnostics build counts each site's queries and their time for the
+//! frame-rate log.
 //!
 //! With `VICTORY_QUERY_CACHE=1`, [`coarse`] answers from what an earlier
 //! question found, per 64 KiB block: the state, kind and allocation of
@@ -38,7 +38,9 @@ pub(crate) enum Site {
     Other,
 }
 
+#[cfg(feature = "diagnostics")]
 const SITES: usize = 11;
+#[cfg(feature = "diagnostics")]
 const NAMES: [&str; SITES] = [
     "is_view",
     "uncommitted_end",
@@ -55,17 +57,26 @@ const NAMES: [&str; SITES] = [
 
 /// Since the last line, per site: questions put to Windows, their
 /// nanoseconds, questions answered from the cache.
+#[cfg(feature = "diagnostics")]
 static CALLS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+#[cfg(feature = "diagnostics")]
 static NS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+#[cfg(feature = "diagnostics")]
 static HITS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 
 /// `VirtualQuery(at)`, counted for `site`.
 pub(crate) fn query(site: Site, at: usize, info: &mut MEMORY_BASIC_INFORMATION) -> usize {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = site;
+    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-    CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
-    NS[site as usize].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
+        NS[site as usize].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     n
 }
 
@@ -199,6 +210,7 @@ pub(crate) fn coarse(site: Site, at: usize) -> Option<Coarse> {
             while k < b + CHAIN && c.blocks.get(&k).is_some_and(|n| n.from == k * BLOCK && n.same(e)) {
                 k += 1;
             }
+            #[cfg(feature = "diagnostics")]
             HITS[site as usize].fetch_add(1, Ordering::Relaxed);
             return Some(Coarse { base: page, end: k * BLOCK, alloc: e.alloc, state: e.state, kind: e.kind });
         }
@@ -283,7 +295,7 @@ pub fn gone(at: usize, len: usize) {
 
 /// The frame-rate line's: per site, questions, ms and cache answers per
 /// frame.
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn line(frames: f64) {
     let mut parts = Vec::new();
     let (mut calls, mut ns) = (0u64, 0u64);
