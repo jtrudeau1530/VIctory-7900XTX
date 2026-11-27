@@ -1353,19 +1353,17 @@ fn view_bytes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
 }
 
-/// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
-/// its buffer has, or one of the view's own bytes ([`off_elements`]).
-fn view_home(
-    shadow: std::sync::Arc<crate::shadow::Shadow>,
+/// A separate copy for a view of `[start, start + len)` that cannot use its
+/// buffer's copy ([`off_elements`]).
+fn separate_view_copy(
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
     start: u64,
     len: u64,
     (stride, raw, format): (u32, bool, u32),
-) -> std::sync::Arc<crate::shadow::Shadow> {
-    let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
-        return shadow;
-    };
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let offset = shadow.offset_in(start).map(|_| shadow.offset(start))?;
     if !view_bytes() {
-        return shadow;
+        return None;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
     // Pick the same copy when creating the descriptor and when refreshing it,
@@ -1375,9 +1373,9 @@ fn view_home(
     }
     let has_raw_twins = victory_shader::emit::raw_views() != 0;
     if !off_elements(offset, stride, raw, element, has_raw_twins) {
-        return shadow;
+        return None;
     }
-    crate::shadow::exact(start, len).unwrap_or(shadow)
+    crate::shadow::exact(start, len).filter(|copy| !std::sync::Arc::ptr_eq(copy, shadow))
 }
 
 /// For device-removed reports: what the slots of the title's view heap that
@@ -3738,10 +3736,12 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         && address - base < width.max(1)
         && let Some(shadow) = crate::shadow::find(base, width)
     {
-        return Some((view_home(shadow, address, len, view_elements(view)?), address, len));
+        let copy = separate_view_copy(&shadow, address, len, view_elements(view)?).unwrap_or(shadow);
+        return Some((copy, address, len));
     }
     let shadow = crate::shadow::find(address, len)?;
-    Some((view_home(shadow, address, len, view_elements(view)?), address, len))
+    let copy = separate_view_copy(&shadow, address, len, view_elements(view)?).unwrap_or(shadow);
+    Some((copy, address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -3901,8 +3901,7 @@ fn buffer_srv(
     let own = unsafe { &mut desc.Anonymous.Buffer };
     let start = address + own.FirstElement * unit;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
-    if !std::sync::Arc::ptr_eq(&home, &shadow) {
+    if let Some(home) = separate_view_copy(&shadow, start, u64::from(own.NumElements) * unit, kind) {
         // Its own bytes: it begins where they do.
         (shadow, offset) = (home, 0);
         own.FirstElement = 0;
@@ -4017,9 +4016,8 @@ fn buffer_uav(
     let own = unsafe { &mut desc.Anonymous.Buffer };
     let start = address + own.FirstElement * unit;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
     let mut address = address;
-    if !std::sync::Arc::ptr_eq(&home, &shadow) {
+    if let Some(home) = separate_view_copy(&shadow, start, u64::from(own.NumElements) * unit, kind) {
         // Its own bytes: it begins where they do.
         (shadow, address) = (home, start);
         own.FirstElement = 0;
